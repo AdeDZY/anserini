@@ -1,86 +1,84 @@
 # -*- coding: utf-8 -*-
 '''
 Anserini: A Lucene toolkit for replicable information retrieval research
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
 http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 '''
-
 import argparse
-import time
+import collections
 
-# Pyserini setup
-import os, sys
-sys.path += ['src/main/python']
-from pyserini.search import pysearch
+from typing import Dict
+from typing import List
+from typing import Set
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Retrieve MS MARCO Passages.')
-    parser.add_argument('--qid_queries', required=True, default='', help='query id - query mapping file')
-    parser.add_argument('--output', required=True, default='', help='output filee')
-    parser.add_argument('--index', required=True, default='', help='index path')
-    parser.add_argument('--hits', default=10, help='number of hits to retrieve')
-    parser.add_argument('--k1', default=0.82, help='BM25 k1 parameter')
-    parser.add_argument('--b', default=0.68, help='BM25 b parameter')
-    # See our MS MARCO documentation to understand how these parameter values were tuned.
-    parser.add_argument('--rm3', action='store_true', default=False, help='use RM3')
-    parser.add_argument('--fbTerms', default=10, type=int, help='RM3 parameter: number of expansion terms')
-    parser.add_argument('--fbDocs', default=10, type=int, help='RM3 parameter: number of documents')
-    parser.add_argument('--originalQueryWeight', default=0.5, type=float, help='RM3 parameter: weight to assign to the original query')
-    parser.add_argument('--threads', default=1, type=int, help='Maximum number of threads')
+
+def load_qrels(path: str) -> Dict[str, Set[str]]:
+    """Loads qrels into a dict of key: query_id, value: set of relevant doc
+    ids."""
+    qrels = collections.defaultdict(set)
+    with open(path) as f:
+        for i, line in enumerate(f):
+            line = ' '.join(line.split())
+            query_id, _, doc_id, relevance = line.rstrip().split(' ')
+            qrels[query_id].add(doc_id)
+            if i % 1000000 == 0:
+                print('Loading qrels {}'.format(i))
+    return qrels
+
+
+def load_run(path: str) -> Dict[str, List[str]]:
+    """Loads run into a dict of key: query_id, value: list of candidate doc
+    ids."""
+    run = collections.OrderedDict()
+    with open(path) as f:
+        for line in f:
+            query_id, _, doc_title, rank, _, _ = line.split(' ')
+            if query_id not in run:
+                run[query_id] = []
+            run[query_id].append((doc_title, int(rank)))
+
+    # Sort candidate docs by rank.
+    sorted_run = collections.OrderedDict()
+    for query_id, doc_titles_ranks in run.items():
+        sorted(doc_titles_ranks, key=lambda x: x[1])
+        doc_titles = [doc_titles for doc_titles, _ in doc_titles_ranks]
+        sorted_run[query_id] = doc_titles
+
+    return sorted_run
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description='measure the percentage of judged documents at various '
+                    'cutoffs.')
+    parser.add_argument('--qrels', type=str, required=True, help='qrels file')
+    parser.add_argument('--run', type=str, required=True, help='run file')
+    parser.add_argument('--cutoffs', nargs='+', type=int,
+                        default=[5, 10, 20, 30],
+                        help='Space-separate list of cutoffs. '
+                             'E.g.: --cutoffs 5 10 20')
 
     args = parser.parse_args()
 
-    total_start_time = time.time()
+    qrels = load_qrels(args.qrels)
+    run = load_run(args.run)
 
-    searcher = pysearch.SimpleSearcher(args.index)
-    searcher.set_bm25_similarity(float(args.k1), float(args.b))
-    print('Initializing BM25, setting k1={} and b={}'.format(args.k1, args.b), flush=True)
-    if args.rm3:
-        searcher.set_rm3_reranker(args.fbTerms, args.fbDocs, args.originalQueryWeight)
-        print('Initializing RM3, setting fbTerms={}, fbDocs={} and originalQueryWeight={}'.format(args.fbTerms, args.fbDocs, args.originalQueryWeight), flush=True)
+    for max_rank in args.cutoffs:
+        percentage_judged = 0
 
-    if args.threads == 1:
+        for query_id, doc_ids in run.items():
+            doc_ids = doc_ids[:max_rank]
+            n_judged = len(set(doc_ids).intersection(qrels[query_id]))
+            percentage_judged += n_judged / len(doc_ids)
 
-        with open(args.output, 'w') as fout:
-            start_time = time.time()
-            for line_number, line in enumerate(open(args.qid_queries, 'r', encoding='utf8')):
-                qid, query = line.strip().split('\t')
-                hits = searcher.search(query.encode('utf8'), int(args.hits))
-                if line_number % 100 == 0:
-                    time_per_query = (time.time() - start_time) / (line_number + 1)
-                    print('Retrieving query {} ({:0.3f} s/query)'.format(line_number, time_per_query), flush=True)
-                for rank in range(len(hits)):
-                    docno = hits[rank].docid
-                    fout.write('{}\t{}\t{}\n'.format(qid, docno, rank + 1))
-    else:
-        qids = []
-        queries = []
-        result_dict = {}
+        percentage_judged /= max(1, len(run))
+        print(f'judged@{max_rank}: {percentage_judged}')
 
-        for line_number, line in enumerate(open(args.qid_queries, 'r', encoding='utf8')):
-            qid, query = line.strip().split('\t')
-            qids.append(qid)
-            queries.append(query)
-
-        results = searcher.batch_search(queries, qids, args.hits, -1, args.threads)
-
-        with open(args.output, 'w') as fout:
-            for qid in qids:
-                hits = results.get(qid)
-                for rank in range(len(hits)):
-                    docno = hits[rank].docid
-                    fout.write('{}\t{}\t{}\n'.format(qid, docno, rank + 1))
-
-    total_time = (time.time() - total_start_time)
-    print('Total retrieval time: {:0.3f} s'.format(total_time))
-    print('Done!')
+    print('Done')
